@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Админка | rshop1.ru</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+    <h1>Добавление товара</h1>
+
+    <form id="product-form">
+        <select id="brand-select" required>
+            <option value="">Выберите бренд</option>
+        </select>
+
+        <select id="category-select" required disabled>
+            <option value="">Выберите категорию</option>
+        </select>
+
+        <input type="text" id="product-name" placeholder="Название" required>
+        <input type="number" id="product-price" placeholder="Цена" required>
+        <input type="file" id="product-photo" accept="image/*" required>
+        <textarea id="product-desc" placeholder="Описание"></textarea>
+        <button type="submit">Добавить</button>
+    </form>
+
+    <script>
+        // Загрузка брендов и категорий
+        async function loadData() {
+            const response = await fetch('/api/admin/data');
+            const data = await response.json();
+
+            const brandSelect = document.getElementById('brand-select');
+            data.brands.forEach(brand => {
+                const option = document.createElement('option');
+                option.value = brand.id;
+                option.textContent = brand.name;
+                brandSelect.appendChild(option);
+            });
+        }
+
+        // Обработка формы
+        document.getElementById('product-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const formData = new FormData();
+            formData.append('brand_id', document.getElementById('brand-select').value);
+            formData.append('category_id', document.getElementById('category-select').value);
+            formData.append('name', document.getElementById('product-name').value);
+            formData.append('price', document.getElementById('product-price').value);
+            formData.append('photo', document.getElementById('product-photo').files[0]);
+            formData.append('description', document.getElementById('product-desc').value);
+
+            const response = await fetch('/api/admin/add_product', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (response.ok) {
+                Telegram.WebApp.showAlert('Товар успешно добавлен!');
+                Telegram.WebApp.close();
+            }
+        });
+
+        // Инициализация
+        Telegram.WebApp.expand();
+        loadData();
+    </script>
+</body>
+</html>

@@ -1,24 +1,26 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import select
-from models import Base, Brand, Category, Product
+from models import Base
 
-DATABASE_URL = "postgresql+asyncpg://tguser:ваш_пароль@localhost/tgshop"
+DATABASE_URL = "postgresql+asyncpg://tguser:123@localhost/tgshop"
 
-engine = create_async_engine(DATABASE_URL)
-async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+engine = create_async_engine(DATABASE_URL, echo=True)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 async def init_db():
+    """Инициализация базы данных с созданием всех таблиц"""
     async with engine.begin() as conn:
+        print("Создание таблиц в базе данных...")
         await conn.run_sync(Base.metadata.create_all)
+        print("Все таблицы успешно созданы")
 
-async def get_brands():
-    async with async_session() as session:
-        result = await session.execute(select(Brand))
-        return result.scalars().all()
-
-async def get_products_by_brand(brand_id: int):
-    async with async_session() as session:
-        result = await session.execute(
-            select(Product).where(Product.brand_id == brand_id))
-        return result.scalars().all()
+async def get_db():
+    """Генератор сессий для зависимостей"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            raise e
+        finally:
+            await session.close()
