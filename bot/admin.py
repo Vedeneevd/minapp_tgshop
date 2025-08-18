@@ -1,6 +1,7 @@
 import os
 import logging
 from functools import wraps
+from typing import Union, List, Any, Callable, Dict
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
@@ -8,15 +9,21 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from models import Brand, Category, Product
 from database import engine, AsyncSessionLocal
+from sqlalchemy.orm import joinedload
 
 router = Router()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ADMINS = [6326719341]  # Ваш Telegram ID
+ADMINS = [6326719341, 790410251, 6388614116, 8188457128]  # Ваш Telegram ID
+
+# Настройки пагинации
+PAGINATION_BRANDS_PER_PAGE = 10
+PAGINATION_CATEGORIES_PER_PAGE = 8
+PAGINATION_PRODUCTS_PER_PAGE = 20
 
 
 # Состояния FSM
@@ -33,6 +40,8 @@ class AddStates(StatesGroup):
 
 
 class EditStates(StatesGroup):
+    brand_name = State()
+    category_name = State()  # Добавлено это состояние
     category_id = State()
     product_id = State()
     field = State()
@@ -40,12 +49,20 @@ class EditStates(StatesGroup):
 
 
 class DeleteStates(StatesGroup):
-    category_id = State()
-    product_id = State()
-    brand_id = State()
+    brand_name = State()
+    category_name = State()
+    product_name = State()
+    confirm_delete = State()
+    select_brand_for_category = State()
+    search_product = State()  # Для поиска товара при редактировании
 
 
-# Улучшенный декоратор для проверки прав администратора
+# Проверка прав администратора
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+
+# Декоратор для проверки прав администратора
 def admin_required(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -59,9 +76,8 @@ def admin_required(func):
             logger.error("Не удалось определить объект update")
             return
 
-        user_id = update.from_user.id
-        if user_id not in ADMINS:
-            logger.warning(f"Попытка несанкционированного доступа: {user_id}")
+        if not await is_admin(update.from_user.id):
+            logger.warning(f"Попытка несанкционированного доступа: {update.from_user.id}")
             if isinstance(update, CallbackQuery):
                 await update.answer("🚫 Доступ запрещён", show_alert=True)
             else:
@@ -87,7 +103,6 @@ async def get_brands(session: AsyncSession):
 
 
 async def get_categories_with_brands(session: AsyncSession):
-    """Получаем категории с именами брендов"""
     result = await session.execute(
         select(Category, Brand)
         .join(Brand, Category.brand_id == Brand.id)
@@ -97,14 +112,20 @@ async def get_categories_with_brands(session: AsyncSession):
 
 
 async def get_products_with_details(session: AsyncSession):
-    result = await session.execute(
-        select(Product, Category, Brand)
-        .select_from(Product)
-        .join(Category, Product.category_id == Category.id)
-        .join(Brand, Category.brand_id == Brand.id)
-        .order_by(Brand.name, Category.name, Product.name)
-    )
-    return result.all()
+    try:
+        result = await session.execute(
+            select(Product)
+            .join(Category, Product.category_id == Category.id)
+            .join(Brand, Category.brand_id == Brand.id)
+            .order_by(Brand.name, Category.name, Product.name)
+            .options(
+                joinedload(Product.category).joinedload(Category.brand)
+            )
+        )
+        return result.unique().scalars().all()
+    except Exception as e:
+        logger.error(f"Ошибка в get_products_with_details: {e}")
+        raise
 
 
 async def get_categories_by_brand(session: AsyncSession, brand_id: int):
@@ -115,13 +136,79 @@ async def get_categories_by_brand(session: AsyncSession, brand_id: int):
     return result.scalars().all()
 
 
-# ========================
-# ГЛАВНОЕ МЕНЮ
-# ========================
+async def get_products(session: AsyncSession):
+    result = await session.execute(select(Product))
+    return result.scalars().all()
 
-@router.message(Command("admin"))
-@admin_required
-async def admin_panel(message: Message):
+
+# Функция для пагинации
+async def send_paginated_message(
+        callback: CallbackQuery,
+        items: List[Any],
+        title: str,
+        item_format: Callable[[Any, int], str],
+        items_per_page: int = 5,
+        current_page: int = 0,
+        back_callback: str = "admin_back",
+        menu_callback: str = None,
+        action_callback: str = None,
+        parse_mode: str = "HTML"
+):
+    total_items = len(items)
+    if total_items == 0:
+        await callback.message.answer(f"{title}\n\nСписок пуст", parse_mode=parse_mode)
+        return
+
+    total_pages = (total_items + items_per_page - 1) // items_per_page
+    start_idx = current_page * items_per_page
+    end_idx = min(start_idx + items_per_page, total_items)
+
+    message_text = f"{title}\n\n"
+    for i, item in enumerate(items[start_idx:end_idx], start_idx + 1):
+        message_text += f"{item_format(item, i)}\n"
+
+    message_text += f"\nСтраница {current_page + 1} из {total_pages}"
+
+    builder = InlineKeyboardBuilder()
+
+    if current_page > 0:
+        builder.button(text="⬅️ Назад", callback_data=f"page_{current_page - 1}")
+    if current_page < total_pages - 1:
+        builder.button(text="Вперёд ➡️", callback_data=f"page_{current_page + 1}")
+
+    if action_callback:
+        for i, item in enumerate(items[start_idx:end_idx], start_idx):
+            item_id = item[0].id if isinstance(item, tuple) else item.id
+            builder.button(
+                text=f"Выбрать {i + 1}",
+                callback_data=f"{action_callback}:{item_id}"
+            )
+        builder.adjust(2, repeat=True)
+
+    if menu_callback:
+        builder.button(text="🔙 В меню", callback_data=menu_callback)
+    else:
+        builder.button(text="🔙 Назад", callback_data=back_callback)
+
+    builder.adjust(2)
+
+    try:
+        await callback.message.edit_text(
+            text=message_text,
+            reply_markup=builder.as_markup(),
+            parse_mode=parse_mode
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await callback.message.answer(
+            text=message_text,
+            reply_markup=builder.as_markup(),
+            parse_mode=parse_mode
+        )
+
+
+# Главное меню админки
+async def admin_panel(update: Union[Message, CallbackQuery]):
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="📦 Товары", callback_data="products_menu"),
@@ -134,21 +221,36 @@ async def admin_panel(message: Message):
         InlineKeyboardButton(text="➕ Добавить категорию", callback_data="add_category_start")
     )
 
-    await message.answer(
-        "👨‍💻 Админ-панель:",
-        reply_markup=builder.as_markup()
-    )
+    if isinstance(update, CallbackQuery):
+        await update.message.edit_text(
+            "👨‍💻 Админ-панель:",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await update.answer(
+            "👨‍💻 Админ-панель:",
+            reply_markup=builder.as_markup()
+        )
 
 
+# Обработчик команды /admin
+@router.message(Command("admin"))
+@admin_required
+async def admin_command(message: Message):
+    await admin_panel(message)
+
+
+# Обработчик кнопки "Назад"
 @router.callback_query(F.data == "admin_back")
 @admin_required
 async def back_to_admin(callback: CallbackQuery):
     try:
-        await callback.message.delete()
+        await admin_panel(callback)
     except Exception as e:
-        logger.error(f"Ошибка при удалении сообщения: {e}")
-    await admin_panel(callback.message)
-    await callback.answer()
+        logger.error(f"Ошибка в обработчике назад: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
+    finally:
+        await callback.answer()
 
 
 # ========================
@@ -158,38 +260,58 @@ async def back_to_admin(callback: CallbackQuery):
 @router.callback_query(F.data == "brands_menu")
 @admin_required
 async def brands_menu(callback: CallbackQuery):
+    """Главное меню управления брендами"""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="📋 Список брендов", callback_data="view_brands"),
         InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_brand_select")
     )
     builder.row(
-        InlineKeyboardButton(text="🗑️ Удалить", callback_data="delete_brand_select"),
-        InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")
+        InlineKeyboardButton(text="➕ Добавить", callback_data="add_brand_start"),
+        InlineKeyboardButton(text="🗑️ Удалить", callback_data="delete_brand_select")
     )
-    await callback.message.edit_text("🏷️ Управление брендами:", reply_markup=builder.as_markup())
-    await callback.answer()
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
+
+    try:
+        await callback.message.edit_text(
+            "🏷️ <b>Управление брендами:</b>",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в brands_menu: {e}")
+        await callback.message.answer(
+            "🏷️ <b>Управление брендами:</b>",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+    finally:
+        await callback.answer()
 
 
 @router.callback_query(F.data == "view_brands")
 @admin_required
 async def view_brands(callback: CallbackQuery):
+    """Просмотр списка брендов с пагинацией"""
     try:
         async with AsyncSessionLocal() as session:
             brands = await get_brands(session)
 
-            if not brands:
-                await callback.message.answer("ℹ️ Брендов пока нет")
-                return await callback.answer()
+            def format_brand(brand: Brand, idx: int) -> str:
+                return f"{idx}. {brand.name} (ID: {brand.id})"
 
-            text = "🏷️ <b>Список брендов:</b>\n\n" + "\n".join(
-                f"{i + 1}. {brand.name} (ID: {brand.id})"
-                for i, brand in enumerate(brands)
+            await send_paginated_message(
+                callback=callback,
+                items=brands,
+                title="🏷️ <b>Список брендов:</b>",
+                item_format=format_brand,
+                items_per_page=PAGINATION_BRANDS_PER_PAGE,
+                menu_callback="brands_menu",
+                parse_mode="HTML"
             )
-            await callback.message.answer(text)
     except Exception as e:
         logger.error(f"Ошибка при получении брендов: {e}")
-        await callback.message.answer("❌ Ошибка при получении списка брендов")
+        await callback.message.answer("❌ Ошибка при загрузке списка брендов")
     finally:
         await callback.answer()
 
@@ -197,7 +319,8 @@ async def view_brands(callback: CallbackQuery):
 @router.callback_query(F.data == "add_brand_start")
 @admin_required
 async def add_brand_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите название нового бренда:")
+    """Начало процесса добавления бренда"""
+    await callback.message.answer("✏️ Введите название нового бренда:")
     await state.set_state(AddStates.brand_name)
     await callback.answer()
 
@@ -205,483 +328,291 @@ async def add_brand_start(callback: CallbackQuery, state: FSMContext):
 @router.message(AddStates.brand_name)
 @admin_required
 async def add_brand_finish(message: Message, state: FSMContext):
-    async with AsyncSession(engine) as session:
-        session.add(Brand(name=message.text))
-        await session.commit()
+    """Завершение добавления бренда"""
+    brand_name = message.text.strip()
+    if not brand_name:
+        await message.answer("❌ Название бренда не может быть пустым. Попробуйте снова:")
+        return
 
-    await message.answer(f"✅ Бренд {message.text} успешно добавлен!")
-    await state.clear()
-    await admin_panel(message)
+    try:
+        async with AsyncSessionLocal() as session:
+            # Проверяем, существует ли уже бренд с таким именем
+            existing_brand = await session.execute(
+                select(Brand).where(func.lower(Brand.name) == func.lower(brand_name)
+                                    ))
+            if existing_brand.scalar_one_or_none():
+                await message.answer(f"❌ Бренд '{brand_name}' уже существует!")
+                await state.clear()
+                return await admin_panel(message)
+
+            # Создаем новый бренд
+            new_brand = Brand(name=brand_name)
+            session.add(new_brand)
+            await session.commit()
+
+            await message.answer(f"✅ Бренд <b>{brand_name}</b> успешно добавлен!", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении бренда: {e}")
+        await message.answer("❌ Произошла ошибка при добавлении бренда")
+    finally:
+        await state.clear()
+        await admin_panel(message)
 
 
 @router.callback_query(F.data == "edit_brand_select")
 @admin_required
-async def select_brand_to_edit(callback: CallbackQuery):
-    async with AsyncSession(engine) as session:
-        brands = await get_brands(session)
-
-        if not brands:
-            await callback.message.answer("ℹ️ Брендов пока нет")
-            return await callback.answer()
-
-        builder = InlineKeyboardBuilder()
-        for brand in brands:
-            builder.button(
-                text=f"{brand.name} (ID: {brand.id})",
-                callback_data=f"edit_brand_{brand.id}"
-            )
-        builder.adjust(1)
-        builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="brands_menu"))
-
-        await callback.message.edit_text(
-            "Выберите бренд для редактирования:",
-            reply_markup=builder.as_markup()
-        )
-        await callback.answer()
+async def edit_brand_select(callback: CallbackQuery, state: FSMContext):
+    """Выбор бренда для редактирования"""
+    await callback.message.answer("🔍 Введите название бренда для редактирования:")
+    await state.set_state(EditStates.brand_name)  # Используем отдельное состояние для редактирования
+    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("edit_brand_"))
+@router.message(EditStates.brand_name)
 @admin_required
-async def edit_brand_name(callback: CallbackQuery, state: FSMContext):
+async def find_brand_to_edit(message: Message, state: FSMContext):
+    """Поиск бренда для редактирования"""
+    search_text = message.text.strip().lower()
+    if not search_text:
+        await message.answer("❌ Введите название бренда:")
+        return
+
     try:
-        brand_id = int(callback.data.split("_")[2])
+        async with AsyncSessionLocal() as session:
+            # Ищем бренд по точному совпадению (регистронезависимо)
+            stmt = select(Brand).where(func.lower(Brand.name) == search_text)
+            result = await session.execute(stmt)
+            brand = result.scalar_one_or_none()
+
+            if not brand:
+                await message.answer(f"❌ Бренд не найден. Проверьте название.")
+                return
+
+            # Сохраняем ID бренда для последующего редактирования
+            await state.update_data(brand_id=brand.id)
+
+            # Создаем клавиатуру с вариантами действий
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(
+                    text="✏️ Изменить название",
+                    callback_data=f"edit_brand_name:{brand.id}"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text="🔙 Назад",
+                    callback_data="brands_menu"
+                )
+            )
+
+            await message.answer(
+                f"🏷 <b>Найден бренд:</b>\n"
+                f"Название: {brand.name}\n"
+                f"ID: {brand.id}\n\n"
+                f"Выберите действие:",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка при поиске бренда: {e}")
+        await message.answer("❌ Произошла ошибка при поиске бренда")
+        await state.clear()
+
+
+@router.callback_query(F.data.startswith("edit_brand_name:"))
+@admin_required
+async def start_edit_brand_name(callback: CallbackQuery, state: FSMContext):
+    """Начало процесса изменения названия бренда"""
+    try:
+        brand_id = int(callback.data.split(":")[1])
         await state.update_data(brand_id=brand_id)
-        await callback.message.answer("Введите новое название бренда:")
+        await callback.message.answer("✏️ Введите новое название бренда:")
         await state.set_state(EditStates.new_value)
-        await callback.answer()
     except Exception as e:
         logger.error(f"Ошибка обработки callback: {e}")
         await callback.answer("❌ Ошибка обработки команды")
+    finally:
+        await callback.answer()
 
 
 @router.message(EditStates.new_value)
 @admin_required
-async def save_brand_name(message: Message, state: FSMContext):
-    data = await state.get_data()
+async def save_edited_brand_name(message: Message, state: FSMContext):
+    """Сохранение нового названия бренда"""
+    new_name = message.text.strip()
+    if not new_name:
+        await message.answer("❌ Название не может быть пустым. Введите новое название:")
+        return
 
-    async with AsyncSession(engine) as session:
-        brand = await session.get(Brand, data.get('brand_id'))
-        if not brand:
-            await message.answer("❌ Бренд не найден")
-            await state.clear()
-            return
-
-        old_name = brand.name
-        brand.name = message.text
-        await session.commit()
-        await message.answer(f"✅ Бренд '{old_name}' переименован в '{message.text}'")
-
-    await state.clear()
-    await admin_panel(message)
-
-
-# ========================
-# УПРАВЛЕНИЕ КАТЕГОРИЯМИ (исправленная версия)
-# ========================
-
-class CategoryStates(StatesGroup):
-    select_brand = State()  # Для выбора бренда при добавлении
-    enter_name = State()  # Для ввода названия категории
-    select_for_edit = State()  # Для выбора категории для редактирования
-    edit_name = State()  # Для ввода нового названия
-    select_for_delete = State()  # Для выбора категории для удаления
-    confirm_delete = State()  # Для подтверждения удаления
-
-
-@router.callback_query(F.data == "categories_menu")
-@admin_required
-async def categories_menu(callback: CallbackQuery):
-    """Главное меню управления категориями"""
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📋 Список категорий", callback_data="view_categories"),
-        InlineKeyboardButton(text="➕ Добавить", callback_data="add_category_start")
-    )
-    builder.row(
-        InlineKeyboardButton(text="✏️ Редактировать", callback_data="start_edit_category"),
-        InlineKeyboardButton(text="🗑️ Удалить", callback_data="start_delete_category")
-    )
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
-
-    await callback.message.edit_text(
-        "📂 Управление категориями:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "view_categories")
-@admin_required
-async def view_categories(callback: CallbackQuery):
-    """Просмотр списка всех категорий с брендами"""
-    try:
-        async with AsyncSessionLocal() as session:
-            categories_with_brands = await get_categories_with_brands(session)
-
-            if not categories_with_brands:
-                await callback.message.answer("ℹ️ Категорий пока нет")
-                return await callback.answer()
-
-            text = "📂 <b>Список категорий:</b>\n\n" + "\n".join(
-                f"{i + 1}. {brand.name} / {category.name} (ID: {category.id})"
-                for i, (category, brand) in enumerate(categories_with_brands)
-            )
-            await callback.message.answer(text)
-    except Exception as e:
-        logger.error(f"Ошибка при просмотре категорий: {e}")
-        await callback.message.answer("❌ Ошибка при загрузке категорий")
-    finally:
-        await callback.answer()
-    # ========================
-
-
-# ДОБАВЛЕНИЕ КАТЕГОРИИ
-# ========================
-
-@router.callback_query(F.data == "add_category_start")
-@admin_required
-async def add_category_start(callback: CallbackQuery, state: FSMContext):
-    """Начало процесса добавления категории - выбор бренда"""
-    try:
-        async with AsyncSessionLocal() as session:
-            brands = await get_brands(session)
-
-            if not brands:
-                await callback.message.answer("ℹ️ Сначала добавьте бренды")
-                await state.clear()
-                return await callback.answer()
-
-            builder = InlineKeyboardBuilder()
-            for brand in brands:
-                builder.button(
-                    text=brand.name,
-                    callback_data=f"select_brand_{brand.id}"
-                )
-            builder.adjust(2)
-            builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="categories_menu"))
-
-            await callback.message.edit_text(
-                "Выберите бренд для новой категории:",
-                reply_markup=builder.as_markup()
-            )
-            await state.set_state(CategoryStates.select_brand)
-    except Exception as e:
-        logger.error(f"Ошибка запуска добавления категории: {e}")
-        await callback.message.answer("❌ Ошибка при запуске добавления категории")
-        await state.clear()
-    finally:
-        await callback.answer()
-
-
-@router.callback_query(CategoryStates.select_brand, F.data.startswith("select_brand_"))
-@admin_required
-async def select_brand_for_category(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора бренда для новой категории"""
-    try:
-        brand_id = int(callback.data.split("_")[2])
-        await state.update_data(brand_id=brand_id)
-        await callback.message.answer("Введите название новой категории:")
-        await state.set_state(CategoryStates.enter_name)
-    except Exception as e:
-        logger.error(f"Ошибка выбора бренда: {e}")
-        await callback.message.answer("❌ Ошибка выбора бренда")
-        await state.clear()
-    finally:
-        await callback.answer()
-
-
-@router.message(CategoryStates.enter_name)
-@admin_required
-async def save_new_category(message: Message, state: FSMContext):
-    """Сохранение новой категории в базу данных"""
     try:
         data = await state.get_data()
         brand_id = data.get('brand_id')
-        category_name = message.text.strip()
-
-        if not brand_id:
-            await message.answer("❌ Бренд не выбран")
-            await state.clear()
-            return
-
-        if not category_name:
-            await message.answer("❌ Название категории не может быть пустым")
-            return
 
         async with AsyncSessionLocal() as session:
-            # Проверяем существование бренда
             brand = await session.get(Brand, brand_id)
             if not brand:
-                await message.answer("❌ Выбранный бренд не найден")
+                await message.answer("❌ Бренд не найден")
                 await state.clear()
                 return
 
-            # Проверяем уникальность названия категории для этого бренда
-            existing = await session.execute(
-                select(Category)
-                .where(and_(
-                    Category.brand_id == brand_id,
-                    func.lower(Category.name) == func.lower(category_name)
-                ))
+            # Проверяем, нет ли уже бренда с таким названием
+            existing_brand = await session.execute(
+                select(Brand).where(
+                    and_(
+                        func.lower(Brand.name) == func.lower(new_name),
+                        Brand.id != brand_id
+                    )
+                )
             )
-            if existing.scalars().first():
-                await message.answer("❌ У этого бренда уже есть категория с таким названием")
+            if existing_brand.scalar_one_or_none():
+                await message.answer(f"❌ Бренд с названием '{new_name}' уже существует!")
                 return
 
-            # Создаем новую категорию
-            new_category = Category(
-                name=category_name,
-                brand_id=brand_id
-            )
-            session.add(new_category)
+            old_name = brand.name
+            brand.name = new_name
             await session.commit()
 
             await message.answer(
-                f"✅ Новая категория успешно добавлена:\n"
-                f"Бренд: {brand.name}\n"
-                f"Категория: {category_name}"
+                f"✅ Бренд успешно обновлен!\n"
+                f"Старое название: {old_name}\n"
+                f"Новое название: {new_name}"
             )
     except Exception as e:
-        logger.error(f"Ошибка сохранения категории: {e}")
-        await message.answer("❌ Ошибка при создании категории")
+        logger.error(f"Ошибка при сохранении бренда: {e}")
+        await message.answer("❌ Произошла ошибка при сохранении изменений")
     finally:
         await state.clear()
         await admin_panel(message)
 
 
-# ========================
-# РЕДАКТИРОВАНИЕ КАТЕГОРИИ
-# ========================
-
-@router.callback_query(F.data == "start_edit_category")
+@router.callback_query(F.data == "delete_brand_select")
 @admin_required
-async def start_edit_category(callback: CallbackQuery, state: FSMContext):
-    """Начало процесса редактирования - выбор категории"""
+async def delete_brand_select(callback: CallbackQuery, state: FSMContext):
+    """Начало процесса удаления бренда"""
+    await callback.message.answer("🔍 Введите название бренда для удаления:")
+    await state.set_state(DeleteStates.brand_name)  # Явно указываем состояние удаления
+    await callback.answer()
+
+
+@router.message(DeleteStates.brand_name)
+@admin_required
+async def find_brand_to_delete(message: Message, state: FSMContext):
+    """Поиск бренда для удаления"""
+    search_text = message.text.strip().lower()
+    if not search_text:
+        await message.answer("❌ Введите название бренда:")
+        return
+
     try:
         async with AsyncSessionLocal() as session:
-            categories_with_brands = await get_categories_with_brands(session)
+            # Ищем бренд по точному совпадению (регистронезависимо)
+            stmt = select(Brand).where(func.lower(Brand.name) == search_text)
+            result = await session.execute(stmt)
+            brand = result.scalar_one_or_none()
 
-            if not categories_with_brands:
-                await callback.answer("ℹ️ Категорий пока нет")
+            if not brand:
+                await message.answer(f"❌ Бренд не найден. Проверьте название.")
                 return
 
-            builder = InlineKeyboardBuilder()
-            for category, brand in categories_with_brands:
-                builder.button(
-                    text=f"{brand.name} / {category.name} (ID: {category.id})",
-                    callback_data=f"select_edit_{category.id}"
-                )
-            builder.adjust(1)
-            builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="categories_menu"))
-
-            await callback.message.edit_text(
-                "Выберите категорию для редактирования:",
-                reply_markup=builder.as_markup()
+            # Проверяем есть ли категории у этого бренда
+            categories_count = await session.execute(
+                select(func.count(Category.id))
+                .where(Category.brand_id == brand.id)
             )
-            await state.set_state(CategoryStates.select_for_edit)
-    except Exception as e:
-        logger.error(f"Ошибка запуска редактирования: {e}")
-        await callback.answer("❌ Ошибка запуска редактирования")
-    finally:
-        await callback.answer()
+            categories_count = categories_count.scalar()
 
+            warning = ""
+            if categories_count > 0:
+                warning = f"\n\n⚠️ Внимание! У этого бренда {categories_count} категорий, они тоже будут удалены!"
 
-@router.callback_query(CategoryStates.select_for_edit, F.data.startswith("select_edit_"))
-@admin_required
-async def select_category_for_edit(callback: CallbackQuery, state: FSMContext):
-    """Выбор конкретной категории для редактирования"""
-    try:
-        category_id = int(callback.data.split("_")[2])
-        await state.update_data(category_id=category_id)
-        await state.set_state(CategoryStates.edit_name)
-        await callback.message.answer("Введите новое название категории:")
-    except Exception as e:
-        logger.error(f"Ошибка выбора категории: {e}")
-        await callback.answer("❌ Ошибка выбора категории")
-    finally:
-        await callback.answer()
-
-
-@router.message(CategoryStates.edit_name)
-@admin_required
-async def save_edited_category(message: Message, state: FSMContext):
-    """Сохранение изменений в категории"""
-    try:
-        data = await state.get_data()
-        category_id = data.get('category_id')
-        new_name = message.text.strip()
-
-        if not category_id:
-            await message.answer("❌ Категория не выбрана")
-            await state.clear()
-            return
-
-        if not new_name:
-            await message.answer("❌ Название не может быть пустым")
-            return
-
-        async with AsyncSessionLocal() as session:
-            category = await session.get(Category, category_id)
-            if not category:
-                await message.answer("❌ Категория не найдена")
-                await state.clear()
-                return
-
-            old_name = category.name
-            category.name = new_name
-            await session.commit()
-
-            await message.answer(
-                f"✅ Категория успешно переименована:\n"
-                f"Было: {old_name}\n"
-                f"Стало: {new_name}"
-            )
-    except Exception as e:
-        logger.error(f"Ошибка сохранения категории: {e}")
-        await message.answer("❌ Ошибка при сохранении изменений")
-    finally:
-        await state.clear()
-        await admin_panel(message)
-
-
-# ========================
-# УДАЛЕНИЕ КАТЕГОРИИ
-# ========================
-
-@router.callback_query(F.data == "start_delete_category")
-@admin_required
-async def start_delete_category(callback: CallbackQuery, state: FSMContext):
-    """Начало процесса удаления - выбор категории"""
-    try:
-        async with AsyncSessionLocal() as session:
-            categories_with_brands = await get_categories_with_brands(session)
-
-            if not categories_with_brands:
-                await callback.answer("ℹ️ Категорий пока нет")
-                return
-
-            builder = InlineKeyboardBuilder()
-            for category, brand in categories_with_brands:
-                builder.button(
-                    text=f"{brand.name} / {category.name} (ID: {category.id})",
-                    callback_data=f"select_delete_{category.id}"
-                )
-            builder.adjust(1)
-            builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="categories_menu"))
-
-            await callback.message.edit_text(
-                "Выберите категорию для удаления:",
-                reply_markup=builder.as_markup()
-            )
-            await state.set_state(CategoryStates.select_for_delete)
-    except Exception as e:
-        logger.error(f"Ошибка запуска удаления: {e}")
-        await callback.message.answer("❌ Ошибка при запуске удаления")
-    finally:
-        await callback.answer()
-
-
-@router.callback_query(CategoryStates.select_for_delete, F.data.startswith("select_delete_"))
-@admin_required
-async def select_category_to_delete(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение удаления выбранной категории"""
-    try:
-        category_id = int(callback.data.split("_")[2])
-        await state.update_data(category_id=category_id)
-
-        async with AsyncSessionLocal() as session:
-            category = await session.get(Category, category_id)
-            if not category:
-                await callback.answer("❌ Категория не найдена", show_alert=True)
-                return
-
-            # Загружаем связанный бренд
-            await session.refresh(category, ['brand'])
-
-            # Проверяем наличие товаров в категории
-            products_count = await session.execute(
-                select(func.count(Product.id))
-                .where(Product.category_id == category_id)
-            )
-            products_count = products_count.scalar()
-
-            if products_count > 0:
-                await callback.answer(
-                    f"❌ В категории есть {products_count} товаров. Сначала удалите их.",
-                    show_alert=True
-                )
-                return
+            await state.update_data(brand_id=brand.id)
 
             builder = InlineKeyboardBuilder()
             builder.row(
-                InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delete"),
-                InlineKeyboardButton(text="❌ Нет, отмена", callback_data="cancel_delete")
+                InlineKeyboardButton(
+                    text="✅ Да, удалить",
+                    callback_data="confirm_brand_delete"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Нет, отмена",
+                    callback_data="cancel_brand_delete"
+                )
             )
 
-            await callback.message.edit_text(
-                f"Вы уверены, что хотите удалить категорию?\n"
-                f"Бренд: {category.brand.name}\n"
-                f"Категория: {category.name} (ID: {category.id})",
+            await message.answer(
+                f"Вы уверены, что хотите удалить бренд?\n"
+                f"Название: {brand.name}\n"
+                f"ID: {brand.id}{warning}",
                 reply_markup=builder.as_markup()
             )
-            await state.set_state(CategoryStates.confirm_delete)
+            await state.set_state(DeleteStates.confirm_delete)
+
     except Exception as e:
-        logger.error(f"Ошибка выбора категории: {e}")
-        await callback.answer("❌ Ошибка выбора категории")
-    finally:
-        await callback.answer()
+        logger.error(f"Ошибка при поиске бренда: {e}")
+        await message.answer("❌ Произошла ошибка при поиске бренда")
+        await state.clear()
 
 
-@router.callback_query(CategoryStates.confirm_delete, F.data == "confirm_delete")
+@router.callback_query(DeleteStates.confirm_delete, F.data == "confirm_brand_delete")
 @admin_required
-async def confirm_category_delete(callback: CallbackQuery, state: FSMContext):
-    """Финальное удаление категории"""
+async def execute_brand_delete(callback: CallbackQuery, state: FSMContext):
+    """Окончательное удаление бренда"""
     try:
         data = await state.get_data()
-        category_id = data.get('category_id')
+        brand_id = data.get('brand_id')
 
-        if not category_id:
-            await callback.answer("❌ Категория не выбрана", show_alert=True)
+        if not brand_id:
+            await callback.message.answer("❌ Бренд не выбран")
             await state.clear()
             return
 
         async with AsyncSessionLocal() as session:
-            category = await session.get(Category, category_id)
-            if not category:
-                await callback.answer("❌ Категория не найдена", show_alert=True)
+            # Получаем бренд со всеми связанными категориями
+            brand = await session.get(Brand, brand_id, options=[joinedload(Brand.categories)])
+            if not brand:
+                await callback.message.answer("❌ Бренд не найден")
                 await state.clear()
                 return
 
-            category_name = category.name
-            brand_name = category.brand.name
-            await session.delete(category)
+            # Удаляем все связанные категории (и их товары через каскадное удаление)
+            for category in brand.categories:
+                await session.delete(category)
+
+            brand_name = brand.name
+            await session.delete(brand)
             await session.commit()
 
-            await callback.message.edit_text(
-                f"✅ Категория успешно удалена:\n"
-                f"Бренд: {brand_name}\n"
-                f"Категория: {category_name}"
+            await callback.message.answer(
+                f"✅ Бренд успешно удалён:\n"
+                f"Название: {brand_name}\n"
+                f"ID: {brand_id}"
             )
     except Exception as e:
-        logger.error(f"Ошибка удаления категории: {e}")
-        await callback.message.edit_text("❌ Ошибка при удалении категории")
+        logger.error(f"Ошибка при удалении бренда: {e}")
+        await callback.message.answer("❌ Произошла ошибка при удалении бренда")
     finally:
         await state.clear()
-        await callback.answer()
+        await admin_panel(callback.message)
 
 
-@router.callback_query(CategoryStates.confirm_delete, F.data == "cancel_delete")
+@router.callback_query(DeleteStates.confirm_delete, F.data == "cancel_brand_delete")
 @admin_required
-async def cancel_category_delete(callback: CallbackQuery, state: FSMContext):
-    """Отмена удаления категории"""
-    try:
-        await state.clear()
-        await callback.message.edit_text("❌ Удаление категории отменено")
-    except Exception as e:
-        logger.error(f"Ошибка отмены удаления: {e}")
-    finally:
-        await callback.answer()
-        await categories_menu(callback)
+async def cancel_brand_delete(callback: CallbackQuery, state: FSMContext):
+    """Отмена удаления бренда"""
+    await state.clear()
+    await callback.message.answer("❌ Удаление бренда отменено")
+    await admin_panel(callback.message)
+
+
+class EditStates(StatesGroup):
+    brand_name = State()
+    category_name = State()  # Добавлено это состояние
+    category_id = State()
+    product_id = State()
+    field = State()
+    new_value = State()
 
 
 # ========================
@@ -706,41 +637,61 @@ async def products_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "view_products")
 @admin_required
-async def view_products(callback: CallbackQuery):
-    """Просмотр списка товаров (без фото)"""
+async def view_products(callback: CallbackQuery, state: FSMContext):
     try:
+        data = await state.get_data()
+        current_page = data.get('products_page', 0)
+
         async with AsyncSessionLocal() as session:
-            products_with_details = await get_products_with_details(session)
+            products = await get_products_with_details(session)
 
-            if not products_with_details:
-                await callback.message.answer("ℹ️ Товаров пока нет")
-                return await callback.answer()
+            # Логируем полученные данные для отладки
+            logger.info(f"Получено {len(products)} записей")
+            if products:
+                logger.info(f"Первая запись: {products[0].name}")
 
-            # Группируем товары по категориям и брендам для лучшего отображения
-            products_by_category = {}
-            for product, category, brand in products_with_details:
+            # Группируем по категориям
+            grouped_data = {}
+            for product in products:
+                category = product.category
+                brand = category.brand
                 key = f"{brand.name} / {category.name}"
-                if key not in products_by_category:
-                    products_by_category[key] = []
-                products_by_category[key].append(product)
+                if key not in grouped_data:
+                    grouped_data[key] = []
+                grouped_data[key].append(product)
 
-            # Формируем сообщение
-            message_text = "📦 <b>Список товаров:</b>\n\n"
-            for category_path, products in products_by_category.items():
-                message_text += f"<b>{category_path}</b>\n"
+            # Формируем плоский список для пагинации
+            flat_list = []
+            for category_path, products in grouped_data.items():
+                flat_list.append(("header", category_path))
                 for product in products:
-                    message_text += (
+                    flat_list.append(("product", product))
+
+            def format_item(item, idx):
+                if item[0] == "header":
+                    return f"\n<b>{item[1]}</b>"
+                else:
+                    product = item[1]
+                    return (
                         f"├ {product.name}\n"
                         f"├─ Цена: {product.price} руб.\n"
                         f"├─ Описание: {product.description or 'нет описания'}\n"
-                        f"└─ ID: {product.id}\n\n"
+                        f"└─ ID: {product.id}"
                     )
 
-            await callback.message.answer(message_text)
+            await send_paginated_message(
+                callback=callback,
+                items=flat_list,
+                title="📦 <b>Список товаров:</b>",
+                item_format=format_item,
+                items_per_page=PAGINATION_PRODUCTS_PER_PAGE,
+                current_page=current_page,
+                menu_callback="products_menu"
+            )
 
     except Exception as e:
-        logger.error(f"Ошибка при получении товаров: {e}", exc_info=True)
-        await callback.message.answer("❌ Ошибка при получении списка товаров")
+        logger.error(f"Полная ошибка в view_products: {e}", exc_info=True)
+        await callback.message.answer("❌ Ошибка при формировании списка товаров")
     finally:
         await callback.answer()
 
@@ -882,52 +833,91 @@ async def add_product_finish(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "edit_product_select")
 @admin_required
-async def select_product_to_edit(callback: CallbackQuery):
-    async with AsyncSession(engine) as session:
-        products = await get_products(session)
+async def start_product_search(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔍 Введите название товара для редактирования:")
+    await state.set_state(DeleteStates.search_product)
+    await callback.answer()
 
-        if not products:
-            await callback.message.answer("ℹ️ Товаров пока нет")
-            return await callback.answer()
 
+@router.message(DeleteStates.search_product)
+@admin_required
+async def find_and_edit_product(message: Message, state: FSMContext):
+    search_text = message.text.strip().lower()
+
+    async with AsyncSessionLocal() as session:
+        # Ищем товар по названию (регистронезависимо)
+        stmt = (
+            select(Product)
+            .join(Category).join(Brand)
+            .where(func.lower(Product.name) == search_text)
+            .options(joinedload(Product.category).joinedload(Category.brand))
+        )
+        result = await session.execute(stmt)
+        product = result.scalar_one_or_none()
+
+        if not product:
+            await message.answer("❌ Товар не найден. Проверьте название или используйте /admin для возврата.")
+            await state.clear()
+            return
+
+        # Сохраняем ID товара для редактирования
+        await state.update_data(product_id=product.id)
+
+        # Формируем информацию о товаре
+        info_text = (
+            f"🏷 Товар: {product.name}\n"
+            f"🏭 Бренд: {product.category.brand.name}\n"
+            f"📂 Категория: {product.category.name}\n"
+            f"💵 Цена: {product.price} руб.\n"
+            f"📝 Описание: {product.description or 'нет'}\n"
+            f"🆔 ID: {product.id}"
+        )
+
+        # Кнопки для выбора поля
         builder = InlineKeyboardBuilder()
-        for product in products:
-            builder.button(
-                text=f"{product.name} (ID: {product.id})",
-                callback_data=f"edit_prod_{product.id}"
-            )
-        builder.adjust(1)
+        builder.row(
+            InlineKeyboardButton(text="✏️ Название", callback_data="edit_field_name"),
+            InlineKeyboardButton(text="💵 Цена", callback_data="edit_field_price")
+        )
+        builder.row(
+            InlineKeyboardButton(text="📝 Описание", callback_data="edit_field_desc"),
+            InlineKeyboardButton(text="🖼️ Фото", callback_data="edit_field_photo")
+        )
         builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="products_menu"))
 
-        await callback.message.edit_text(
-            "Выберите товар для редактирования:",
-            reply_markup=builder.as_markup()
-        )
-        await callback.answer()
+        # Отправляем фото товара (если есть)
+        if product.photo_url:
+            try:
+                photo = FSInputFile(f"/var/www/rshop/static/{product.photo_url}")
+                await message.answer_photo(photo, caption=info_text, reply_markup=builder.as_markup())
+            except:
+                await message.answer(info_text, reply_markup=builder.as_markup())
+        else:
+            await message.answer(info_text, reply_markup=builder.as_markup())
 
 
-@router.callback_query(F.data.startswith("edit_prod_"))
+@router.callback_query(F.data.startswith("select_product_"))
 @admin_required
-async def select_product_field(callback: CallbackQuery, state: FSMContext):
-    product_id = int(callback.data.split("_")[2])
-    await state.update_data(product_id=product_id)
+async def handle_product_selection(callback: CallbackQuery):
+    try:
+        product_id = int(callback.data.split("_")[2])
 
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✏️ Название", callback_data="edit_field_name"),
-        InlineKeyboardButton(text="💵 Цена", callback_data="edit_field_price")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📝 Описание", callback_data="edit_field_desc"),
-        InlineKeyboardButton(text="🖼️ Фото", callback_data="edit_field_photo")
-    )
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="products_menu"))
+        async with AsyncSessionLocal() as session:
+            product = await session.get(
+                Product,
+                product_id,
+                options=[joinedload(Product.category).joinedload(Category.brand)]
+            )
 
-    await callback.message.edit_text(
-        "Выберите что редактировать:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
+            if product:
+                await callback.message.delete()  # Удаляем сообщение со списком
+                await show_product_edit_options(callback.message, product)
+            else:
+                await callback.answer("❌ Товар не найден", show_alert=True)
+
+    except Exception as e:
+        logger.error(f"Ошибка выбора товара: {str(e)}", exc_info=True)
+        await callback.answer("⚠️ Ошибка при выборе товара", show_alert=True)
 
 
 @router.callback_query(F.data == "edit_field_name")
@@ -1013,3 +1003,538 @@ async def save_product_changes(message: Message, state: FSMContext):
 
     await state.clear()
     await admin_panel(message)
+
+
+@router.callback_query(F.data == "delete_product_select")
+@admin_required
+async def delete_product_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите название товара для удаления:")
+    await state.set_state(DeleteStates.product_name)
+    await callback.answer()
+
+
+@router.message(DeleteStates.product_name)
+@admin_required
+async def delete_product_confirm(message: Message, state: FSMContext):
+    product_name = message.text.strip()
+
+    async with AsyncSession(engine) as session:
+        # Ищем товар по имени (регистронезависимо)
+        stmt = select(Product).where(func.lower(Product.name) == func.lower(product_name))
+        result = await session.execute(stmt)
+        product = result.scalar_one_or_none()
+
+        if not product:
+            await message.answer(f"❌ Товар '{product_name}' не найден")
+            await state.clear()
+            return
+
+        # Получаем категорию и бренд для отображения
+        category = await session.get(Category, product.category_id)
+        brand = await session.get(Brand, category.brand_id)
+
+        await state.update_data(product_id=product.id)
+
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_product_delete"),
+            InlineKeyboardButton(text="❌ Нет, отмена", callback_data="admin_back")
+        )
+
+        await message.answer(
+            f"Вы уверены, что хотите удалить товар?\n"
+            f"Бренд: {brand.name}\n"
+            f"Категория: {category.name}\n"
+            f"Товар: {product.name}\n"
+            f"Цена: {product.price} руб.\n"
+            f"ID: {product.id}",
+            reply_markup=builder.as_markup()
+        )
+        await state.set_state(DeleteStates.confirm_delete)
+
+
+@router.callback_query(DeleteStates.confirm_delete, F.data == "confirm_product_delete")
+@admin_required
+async def delete_product_execute(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get('product_id')
+
+    if not product_id:
+        await callback.message.answer("❌ Товар не выбран")
+        await state.clear()
+        return
+
+    async with AsyncSession(engine) as session:
+        product = await session.get(Product, product_id)
+        if not product:
+            await callback.message.answer("❌ Товар не найден")
+            await state.clear()
+            return
+
+        # Удаляем фото товара
+        if product.photo_url:
+            photo_path = f"/var/www/rshop/static/{product.photo_url}"
+            if os.path.exists(photo_path):
+                try:
+                    os.remove(photo_path)
+                except Exception as e:
+                    logger.error(f"Ошибка удаления фото: {e}")
+
+        product_name = product.name
+        await session.delete(product)
+        await session.commit()
+
+        await callback.message.answer(
+            f"✅ Товар успешно удалён:\n"
+            f"Название: {product_name}\n"
+            f"ID: {product_id}"
+        )
+
+    await state.clear()
+    await admin_panel(callback.message)
+
+
+# Обработчик пагинации
+@router.callback_query(F.data.startswith("page_"))
+@admin_required
+async def handle_pagination(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.split("_")[1])
+        await state.update_data(products_page=page)  # Явно сохраняем страницу товаров
+
+        # Определяем контекст по тексту сообщения
+        message_text = callback.message.text or ""
+
+        if "товар" in message_text.lower():
+            await view_products(callback, state)
+        elif "бренд" in message_text.lower():
+            await view_brands(callback, state)
+        elif "категори" in message_text.lower():
+            await view_categories(callback, state)
+        else:
+            await callback.answer("Неизвестный контекст пагинации")
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки пагинации: {e}", exc_info=True)
+        await callback.answer("❌ Ошибка при переключении страницы")
+
+
+# ========================
+# УПРАВЛЕНИЕ КАТЕГОРИЯМИ (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ========================
+
+class CategoryStates(StatesGroup):
+    select_brand = State()
+    enter_name = State()
+    edit_select = State()
+    edit_enter_name = State()
+    delete_select = State()
+    delete_confirm = State()
+
+
+@router.callback_query(F.data == "categories_menu")
+@admin_required
+async def categories_menu(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📋 Список категорий", callback_data="view_categories"),
+        InlineKeyboardButton(text="➕ Добавить", callback_data="add_category_start")
+    )
+    builder.row(
+        InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_category_start"),
+        InlineKeyboardButton(text="🗑️ Удалить", callback_data="delete_category_start")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
+
+    try:
+        await callback.message.edit_text(
+            "📂 Управление категориями:",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в меню категорий: {e}")
+        await callback.answer("❌ Ошибка при отображении меню")
+
+
+@router.callback_query(F.data == "view_categories")
+@admin_required
+async def view_categories(callback: CallbackQuery):
+    try:
+        async with AsyncSessionLocal() as session:
+            categories = await session.execute(
+                select(Category)
+                .options(joinedload(Category.brand))
+                .order_by(Category.name)
+            )
+            categories = categories.unique().scalars().all()
+
+            if not categories:
+                await callback.message.answer("ℹ️ Список категорий пуст")
+                return
+
+            def format_category(category: Category, idx: int) -> str:
+                return f"{idx}. {category.brand.name} / {category.name} (ID: {category.id})"
+
+            await send_paginated_message(
+                callback=callback,
+                items=categories,
+                title="📂 Список категорий:",
+                item_format=format_category,
+                items_per_page=PAGINATION_CATEGORIES_PER_PAGE,
+                menu_callback="categories_menu"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке категорий: {e}")
+        await callback.answer("❌ Ошибка при загрузке списка")
+
+
+@router.callback_query(F.data == "add_category_start")
+@admin_required
+async def add_category_start(callback: CallbackQuery, state: FSMContext):
+    try:
+        async with AsyncSessionLocal() as session:
+            brands = await session.execute(select(Brand).order_by(Brand.name))
+            brands = brands.scalars().all()
+
+            if not brands:
+                await callback.message.answer("ℹ️ Сначала добавьте бренды")
+                return
+
+            builder = InlineKeyboardBuilder()
+            for brand in brands:
+                builder.button(text=brand.name, callback_data=f"add_cat_brand_{brand.id}")
+
+            builder.adjust(2)
+            builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="categories_menu"))
+
+            await callback.message.edit_text(
+                "Выберите бренд для новой категории:",
+                reply_markup=builder.as_markup()
+            )
+            await state.set_state(CategoryStates.select_brand)
+    except Exception as e:
+        logger.error(f"Ошибка при запуске добавления: {e}")
+        await callback.answer("❌ Ошибка при запуске")
+
+
+@router.callback_query(CategoryStates.select_brand, F.data.startswith("add_cat_brand_"))
+@admin_required
+async def select_brand_for_category(callback: CallbackQuery, state: FSMContext):
+    try:
+        brand_id = int(callback.data.split("_")[3])
+        await state.update_data(brand_id=brand_id)
+        await callback.message.answer("Введите название новой категории:")
+        await state.set_state(CategoryStates.enter_name)
+    except Exception as e:
+        logger.error(f"Ошибка выбора бренда: {e}")
+        await callback.answer("❌ Ошибка выбора")
+
+
+@router.message(CategoryStates.enter_name)
+@admin_required
+async def save_new_category(message: Message, state: FSMContext):
+    try:
+        category_name = message.text.strip()
+        if not category_name:
+            await message.answer("❌ Название не может быть пустым. Введите снова:")
+            return
+
+        data = await state.get_data()
+        brand_id = data.get('brand_id')
+
+        async with AsyncSessionLocal() as session:
+            # Проверка на существующую категорию
+            existing = await session.scalar(
+                select(Category).where(
+                    and_(
+                        Category.brand_id == brand_id,
+                        func.lower(Category.name) == func.lower(category_name)
+                    )
+                )
+            )
+
+            if existing:
+                await message.answer("❌ Категория с таким названием уже существует")
+                return
+
+            new_category = Category(name=category_name, brand_id=brand_id)
+            session.add(new_category)
+            await session.commit()
+
+            await message.answer(f"✅ Категория '{category_name}' успешно добавлена")
+            await admin_panel(message)
+
+    except Exception as e:
+        logger.error(f"Ошибка сохранения категории: {e}")
+        await message.answer("❌ Ошибка при сохранении категории")
+    finally:
+        await state.clear()
+
+
+@router.callback_query(F.data == "edit_category_start")
+@admin_required
+async def edit_category_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔍 Введите название категории для редактирования:")
+    await state.set_state(CategoryStates.edit_select)
+    await callback.answer()
+
+
+@router.message(CategoryStates.edit_select)
+@admin_required
+async def find_category_to_edit(message: Message, state: FSMContext):
+    try:
+        search_text = message.text.strip().lower()
+        if not search_text:
+            await message.answer("❌ Введите название категории:")
+            return
+
+        async with AsyncSessionLocal() as session:
+            categories = await session.execute(
+                select(Category)
+                .join(Brand)
+                .where(func.lower(Category.name) == search_text)
+                .options(joinedload(Category.brand))
+            )
+            categories = categories.unique().scalars().all()
+
+            if not categories:
+                await message.answer("❌ Категория не найдена")
+                return
+
+            if len(categories) == 1:
+                category = categories[0]
+                await state.update_data(category_id=category.id)
+                await message.answer(
+                    f"Найдена категория: {category.brand.name} / {category.name}\n"
+                    "Введите новое название:"
+                )
+                await state.set_state(CategoryStates.edit_enter_name)
+            else:
+                builder = InlineKeyboardBuilder()
+                for category in categories:
+                    builder.button(
+                        text=f"{category.brand.name} - {category.name}",
+                        callback_data=f"edit_cat_{category.id}"
+                    )
+                builder.adjust(1)
+                await message.answer(
+                    "Найдено несколько категорий. Выберите нужную:",
+                    reply_markup=builder.as_markup()
+                )
+    except Exception as e:
+        logger.error(f"Ошибка поиска категории: {e}")
+        await message.answer("❌ Ошибка при поиске категории")
+
+
+@router.callback_query(F.data.startswith("edit_cat_"))
+@admin_required
+async def select_category_to_edit(callback: CallbackQuery, state: FSMContext):
+    try:
+        category_id = int(callback.data.split("_")[1])
+        await state.update_data(category_id=category_id)
+        await callback.message.answer("Введите новое название категории:")
+        await state.set_state(CategoryStates.edit_enter_name)
+    except Exception as e:
+        logger.error(f"Ошибка выбора категории: {e}")
+        await callback.answer("❌ Ошибка при выборе категории")
+
+
+@router.message(CategoryStates.edit_enter_name)
+@admin_required
+async def save_edited_category(message: Message, state: FSMContext):
+    try:
+        new_name = message.text.strip()
+        if not new_name:
+            await message.answer("❌ Название не может быть пустым. Введите снова:")
+            return
+
+        data = await state.get_data()
+        category_id = data.get('category_id')
+
+        async with AsyncSessionLocal() as session:
+            category = await session.get(Category, category_id, options=[joinedload(Category.brand)])
+            if not category:
+                await message.answer("❌ Категория не найдена")
+                await state.clear()
+                return
+
+            # Проверка на дубликат
+            existing = await session.scalar(
+                select(Category).where(
+                    and_(
+                        Category.brand_id == category.brand_id,
+                        func.lower(Category.name) == func.lower(new_name),
+                        Category.id != category_id
+                    )
+                )
+            )
+            if existing:
+                await message.answer("❌ Категория с таким названием уже существует")
+                return
+
+            old_name = category.name
+            category.name = new_name
+            await session.commit()
+
+            await message.answer(
+                f"✅ Категория успешно обновлена\n"
+                f"Было: {old_name}\n"
+                f"Стало: {new_name}"
+            )
+            await admin_panel(message)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения изменений: {e}")
+        await message.answer("❌ Ошибка при сохранении изменений")
+    finally:
+        await state.clear()
+
+
+@router.callback_query(F.data == "delete_category_start")
+@admin_required
+async def delete_category_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔍 Введите название категории для удаления:")
+    await state.set_state(CategoryStates.delete_select)
+    await callback.answer()
+
+
+@router.message(CategoryStates.delete_select)
+@admin_required
+async def find_category_to_delete(message: Message, state: FSMContext):
+    try:
+        search_text = message.text.strip().lower()
+        if not search_text:
+            await message.answer("❌ Введите название категории:")
+            return
+
+        async with AsyncSessionLocal() as session:
+            categories = await session.execute(
+                select(Category)
+                .join(Brand)
+                .where(func.lower(Category.name) == search_text)
+                .options(joinedload(Category.brand))
+            )
+            categories = categories.unique().scalars().all()
+
+            if not categories:
+                await message.answer("❌ Категория не найдена")
+                await state.clear()
+                return
+
+            if len(categories) == 1:
+                category = categories[0]
+                await show_delete_confirmation(message, state, category)
+            else:
+                builder = InlineKeyboardBuilder()
+                for category in categories:
+                    builder.button(
+                        text=f"{category.brand.name}",
+                        callback_data=f"del_cat_{category.id}"
+                    )
+                builder.adjust(2)
+                await message.answer(
+                    "Найдено несколько категорий. Выберите нужную:",
+                    reply_markup=builder.as_markup()
+                )
+                await state.update_data(categories={c.id: c for c in categories})
+    except Exception as e:
+        logger.error(f"Ошибка поиска категории: {e}")
+        await message.answer("❌ Ошибка при поиске категории")
+
+
+async def show_delete_confirmation(message: Message, state: FSMContext, category: Category):
+    try:
+        async with AsyncSessionLocal() as session:
+            products_count = await session.scalar(
+                select(func.count(Product.id)).where(Product.category_id == category.id)
+            )
+
+            warning = ""
+            if products_count > 0:
+                warning = f"\n\n⚠️ Внимание! В этой категории {products_count} товаров, они тоже будут удалены!"
+
+            await state.update_data(category_id=category.id)
+
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_category_delete"),
+                InlineKeyboardButton(text="❌ Нет, отмена", callback_data="cancel_category_delete")
+            )
+
+            await message.answer(
+                f"Вы уверены, что хотите удалить категорию?\n"
+                f"Бренд: {category.brand.name}\n"
+                f"Категория: {category.name}\n"
+                f"ID: {category.id}{warning}",
+                reply_markup=builder.as_markup()
+            )
+            await state.set_state(CategoryStates.delete_confirm)
+    except Exception as e:
+        logger.error(f"Ошибка подтверждения удаления: {e}")
+        await message.answer("❌ Ошибка при подготовке удаления")
+
+
+@router.callback_query(F.data.startswith("del_cat_"))
+@admin_required
+async def select_category_to_delete(callback: CallbackQuery, state: FSMContext):
+    try:
+        category_id = int(callback.data.split("_")[2])
+        data = await state.get_data()
+        categories = data.get('categories', {})
+        category = categories.get(category_id)
+
+        if not category:
+            await callback.answer("❌ Категория не найдена")
+            return
+
+        await callback.message.delete()
+        await show_delete_confirmation(callback.message, state, category)
+    except Exception as e:
+        logger.error(f"Ошибка выбора категории: {e}")
+        await callback.answer("❌ Ошибка при выборе категории")
+
+
+@router.callback_query(CategoryStates.delete_confirm, F.data == "confirm_category_delete")
+@admin_required
+async def execute_category_delete(callback: CallbackQuery, state: FSMContext):
+    try:
+        data = await state.get_data()
+        category_id = data.get('category_id')
+
+        if not category_id:
+            await callback.message.answer("❌ Категория не выбрана")
+            await state.clear()
+            return
+
+        async with AsyncSessionLocal() as session:
+            category = await session.get(Category, category_id, options=[joinedload(Category.brand)])
+            if not category:
+                await callback.message.answer("❌ Категория не найдена")
+                await state.clear()
+                return
+
+            category_name = category.name
+            brand_name = category.brand.name
+
+            await session.delete(category)
+            await session.commit()
+
+            await callback.message.answer(
+                f"✅ Категория успешно удалена:\n"
+                f"Бренд: {brand_name}\n"
+                f"Категория: {category_name}\n"
+                f"ID: {category_id}"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при удалении категории: {e}")
+        await callback.message.answer("❌ Ошибка при удалении категории")
+    finally:
+        await state.clear()
+        await admin_panel(callback.message)
+
+
+@router.callback_query(CategoryStates.delete_confirm, F.data == "cancel_category_delete")
+@admin_required
+async def cancel_category_delete(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Удаление категории отменено")
+    await admin_panel(callback.message)
